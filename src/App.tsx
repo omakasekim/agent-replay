@@ -4,18 +4,23 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  ClipboardPaste,
   Clock,
   Coins,
+  Columns2,
   Copy,
   Download,
+  FastForward,
   FileCode2,
   Flame,
+  Gauge,
   Pause,
   Play,
   Terminal,
   Upload,
+  X,
 } from 'lucide-react';
-import { DEMO_AGENT_SESSION_JSON } from './core/demoSession.ts';
+import { DEMO_AGENT_SESSION_JSON, DEMO_SESSION_PRESETS } from './core/demoSession.ts';
 import {
   buildReplaySession,
   buildUnifiedDiffLines,
@@ -34,16 +39,27 @@ const KIND_BADGE: Record<StepKind, string> = {
 };
 
 export function App() {
+  const [presetId, setPresetId] = useState<string>('rate-limiter');
   const [session, setSession] = useState<ReplaySession>(() =>
-    buildReplaySession(DEMO_AGENT_SESSION_JSON, { id: 'demo', isDemo: true }),
+    buildReplaySession(DEMO_AGENT_SESSION_JSON, { id: 'rate-limiter', isDemo: true }),
   );
   const [stepIdx, setStepIdx] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState<0.5 | 1 | 2>(1);
   const [patchMode, setPatchMode] = useState<'step' | 'rollback'>('step');
+  const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
+  const [heatmapScope, setHeatmapScope] = useState<'upto' | 'full'>('upto');
   const [copiedPatch, setCopiedPatch] = useState(false);
   const [selectedSnapFile, setSelectedSnapFile] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+
+  const isLocalServer =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
 
   useEffect(() => {
+    if (!isLocalServer) return;
     fetch('/api/session')
       .then((r) => (r.ok ? r.json() : null))
       .then((data: ReplaySession | null) => {
@@ -53,15 +69,16 @@ export function App() {
         }
       })
       .catch(() => {});
-  }, []);
+  }, [isLocalServer]);
 
   useEffect(() => {
     if (!playing || session.steps.length === 0) return;
+    const intervalMs = Math.round(1450 / speed);
     const t = setInterval(() => {
       setStepIdx((prev) => (prev + 1 < session.steps.length ? prev + 1 : 0));
-    }, 1500);
+    }, intervalMs);
     return () => clearInterval(t);
-  }, [playing, session.steps.length]);
+  }, [playing, speed, session.steps.length]);
 
   const currentStep = session.steps[stepIdx] ?? session.steps[0];
   const currentSnapshot = session.snapshotsByStep[stepIdx] ?? {};
@@ -74,6 +91,71 @@ export function App() {
       setSelectedSnapFile(snapshotFiles[0]);
     }
   }, [stepIdx, currentStep, snapshotFiles.length]);
+
+  const loadPreset = (id: string) => {
+    const found = DEMO_SESSION_PRESETS.find((p) => p.id === id);
+    if (!found) return;
+    setPresetId(found.id);
+    setSession(buildReplaySession(found.raw, { id: found.id, isDemo: true }));
+    setStepIdx(0);
+    setPlaying(false);
+  };
+
+  // Cumulative token & cost curve data
+  const burnCurve = useMemo(() => {
+    let cumTokens = 0;
+    let cumCost = 0;
+    return session.steps.map((s) => {
+      cumTokens += s.inputTokens + s.cacheReadTokens + s.outputTokens;
+      cumCost += s.costUsd;
+      return {
+        index: s.index,
+        cumTokens,
+        cumCost,
+        stepTokens: s.inputTokens + s.cacheReadTokens + s.outputTokens,
+        outcome: s.outcome,
+        kind: s.kind,
+      };
+    });
+  }, [session.steps]);
+
+  const cacheHitPct = useMemo(() => {
+    const denom = session.totals.inputTokens + session.totals.cacheReadTokens;
+    return denom > 0 ? Math.round((session.totals.cacheReadTokens / denom) * 100) : 0;
+  }, [session.totals]);
+
+  const wastedFailCost = useMemo(
+    () => session.steps.filter((s) => s.outcome === 'fail').reduce((acc, s) => acc + s.costUsd, 0),
+    [session.steps],
+  );
+
+  // Dynamic time-travel heatmap (touch counts up to current step vs full session)
+  const dynamicHeatmap = useMemo(() => {
+    if (heatmapScope === 'full') return session.heatmap;
+    const map = new Map<string, { reads: number; edits: number; estimatedBytes: number; touchedAtSteps: number[] }>();
+    for (const f of session.heatmap) {
+      map.set(f.path, { reads: 0, edits: 0, estimatedBytes: f.estimatedBytes, touchedAtSteps: [] });
+    }
+    for (let i = 0; i <= stepIdx && i < session.steps.length; i++) {
+      const s = session.steps[i];
+      if (!s.targetFile) continue;
+      const entry = map.get(s.targetFile) ?? { reads: 0, edits: 0, estimatedBytes: 300, touchedAtSteps: [] };
+      if (s.kind === 'edit' || s.kind === 'write') entry.edits += 1;
+      else entry.reads += 1;
+      entry.touchedAtSteps.push(i);
+      map.set(s.targetFile, entry);
+    }
+    return Array.from(map.entries())
+      .map(([path, v]) => ({
+        path,
+        reads: v.reads,
+        edits: v.edits,
+        thrashScore: v.edits * 2 + v.reads,
+        estimatedBytes: v.estimatedBytes,
+        touchedAtSteps: v.touchedAtSteps,
+      }))
+      .sort((a, b) => b.thrashScore - a.thrashScore);
+  }, [session, stepIdx, heatmapScope]);
 
   const maxTokensInStep = useMemo(
     () =>
@@ -93,6 +175,35 @@ export function App() {
     );
   }, [currentStep]);
 
+  // Split side-by-side pairs
+  const splitRows = useMemo(() => {
+    const rows: Array<{
+      oldLn: number | null;
+      oldText: string;
+      oldKind: 'del' | 'context' | 'empty';
+      newLn: number | null;
+      newText: string;
+      newKind: 'add' | 'context' | 'empty';
+    }> = [];
+    for (const l of stepDiffLines) {
+      if (l.type === 'context') {
+        rows.push({ oldLn: l.oldLn, oldText: l.text, oldKind: 'context', newLn: l.newLn, newText: l.text, newKind: 'context' });
+      } else if (l.type === 'del') {
+        rows.push({ oldLn: l.oldLn, oldText: l.text, oldKind: 'del', newLn: null, newText: '', newKind: 'empty' });
+      } else {
+        const last = rows[rows.length - 1];
+        if (last && last.oldKind === 'del' && last.newKind === 'empty') {
+          last.newLn = l.newLn;
+          last.newText = l.text;
+          last.newKind = 'add';
+        } else {
+          rows.push({ oldLn: null, oldText: '', oldKind: 'empty', newLn: l.newLn, newText: l.text, newKind: 'add' });
+        }
+      }
+    }
+    return rows;
+  }, [stepDiffLines]);
+
   const activePatch = useMemo(() => {
     if (!currentStep) return '';
     return patchMode === 'step'
@@ -100,17 +211,29 @@ export function App() {
       : generateRollbackFromStepPatch(session, stepIdx);
   }, [session, stepIdx, patchMode, currentStep]);
 
-  const handleUploadLog = async (file: File) => {
-    const text = await file.text();
+  const loadTranscriptText = (text: string, label: string) => {
     const parsed = buildReplaySession(text, {
-      id: file.name,
-      title: `Uploaded: ${file.name}`,
+      id: label,
+      title: `Loaded: ${label}`,
       isDemo: false,
     });
     if (parsed.steps.length > 0) {
+      setPresetId('custom');
       setSession(parsed);
       setStepIdx(0);
       setPlaying(false);
+    }
+  };
+
+  const jumpToNext = (predicate: (s: ReplaySession['steps'][number]) => boolean) => {
+    const n = session.steps.length;
+    for (let offset = 1; offset <= n; offset++) {
+      const idx = (stepIdx + offset) % n;
+      if (predicate(session.steps[idx])) {
+        setPlaying(false);
+        setStepIdx(idx);
+        return;
+      }
     }
   };
 
@@ -133,34 +256,74 @@ export function App() {
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   };
 
+  // Burn curve SVG path computation
+  const burnSvg = useMemo(() => {
+    const w = 320;
+    const h = 44;
+    if (burnCurve.length < 2) return { line: '', area: '', playX: 0, playY: h };
+    const maxTok = Math.max(1, burnCurve[burnCurve.length - 1].cumTokens);
+    const pts = burnCurve.map((p, i) => {
+      const x = (i / (burnCurve.length - 1)) * w;
+      const y = h - 4 - (p.cumTokens / maxTok) * (h - 10);
+      return { x, y, fail: p.outcome === 'fail', index: p.index };
+    });
+    const line = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+    const area = `${line} L ${w} ${h} L 0 ${h} Z`;
+    const activePt = pts[Math.min(stepIdx, pts.length - 1)] ?? pts[0];
+    return { line, area, pts, playX: activePt.x, playY: activePt.y };
+  }, [burnCurve, stepIdx]);
+
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-[#0B0F17] text-slate-100">
+    <div
+      className="flex h-screen flex-col overflow-hidden bg-[#0B0F17] text-slate-100"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={async (e) => {
+        e.preventDefault();
+        const f = e.dataTransfer.files?.[0];
+        if (f) loadTranscriptText(await f.text(), f.name);
+      }}
+    >
       {/* Header */}
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-[#111827] px-4 py-2.5">
-        <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-violet-500/40 bg-violet-500/15 text-violet-300">
-            <Clock className="h-4 w-4" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-sm font-bold text-slate-50">agent-replay</h1>
-              <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-violet-300">
-                {session.model}
-              </span>
-              {session.isDemo && (
-                <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
-                  DEMO TRACE
-                </span>
-              )}
+      <header className="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-800 bg-[#111827] px-4 py-2.5">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-violet-500/40 bg-violet-500/15 text-violet-300">
+              <Clock className="h-4 w-4" />
             </div>
-            <p className="text-[11px] text-slate-400">
-              {session.title} · {session.steps.length} steps ·{' '}
-              <span className="font-mono text-amber-300">{session.totals.thrashFiles} thrash hotspot(s)</span>
-            </p>
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-sm font-bold text-slate-50">agent-replay</h1>
+                <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-violet-300">
+                  {session.model}
+                </span>
+                {session.isDemo && (
+                  <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+                    INTERACTIVE TRACE
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-400">
+                {session.title} · {session.steps.length} steps ·{' '}
+                <span className="font-mono text-amber-300">{session.totals.thrashFiles} thrash hotspot(s)</span>
+              </p>
+            </div>
           </div>
+
+          <select
+            value={presetId}
+            onChange={(e) => loadPreset(e.target.value)}
+            className="rounded-lg border border-slate-700 bg-[#0B0F17] px-2.5 py-1 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
+          >
+            {DEMO_SESSION_PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>
+                Preset: {p.label}
+              </option>
+            ))}
+            {presetId === 'custom' && <option value="custom">Custom Uploaded / Pasted Trace</option>}
+          </select>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-3 rounded-lg border border-slate-800 bg-[#0B0F17] px-3 py-1 font-mono text-xs">
             <span className="text-slate-400">
               Tokens <strong className="text-slate-100">{(session.totals.totalTokens / 1000).toFixed(1)}k</strong>
@@ -168,28 +331,72 @@ export function App() {
             <span className="flex items-center gap-1 text-emerald-400">
               <Coins className="h-3.5 w-3.5" />${session.totals.totalCostUsd.toFixed(4)}
             </span>
-            <span className="text-rose-400">{session.totals.failedCommands} test fail(s)</span>
+            <span className="hidden items-center gap-1 text-sky-300 md:inline-flex" title="Prompt cache hit ratio">
+              <Gauge className="h-3.5 w-3.5" /> {cacheHitPct}% cache
+            </span>
+            <span className="text-rose-400">{session.totals.failedCommands} fail(s)</span>
           </div>
+
+          <button
+            type="button"
+            onClick={() => setPasteOpen((v) => !v)}
+            className="inline-flex items-center gap-1 rounded-lg border border-violet-500/40 bg-violet-500/10 px-2.5 py-1 text-xs font-medium text-violet-200 hover:bg-violet-500/20"
+          >
+            <ClipboardPaste className="h-3.5 w-3.5" />
+            <span>Paste Log</span>
+          </button>
 
           <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700 bg-[#0B0F17] px-2.5 py-1 text-xs text-slate-200 hover:border-violet-500">
             <Upload className="h-3.5 w-3.5 text-violet-400" />
-            <span>Load JSON / JSONL</span>
+            <span>JSONL</span>
             <input
               type="file"
               accept=".json,.jsonl"
               className="hidden"
-              onChange={(e) => {
+              onChange={async (e) => {
                 const f = e.target.files?.[0];
-                if (f) handleUploadLog(f);
+                if (f) loadTranscriptText(await f.text(), f.name);
               }}
             />
           </label>
         </div>
       </header>
 
-      {/* Top Scrubbable Timeline + Token/Cost Bar Chart */}
+      {/* Paste Transcript Drawer */}
+      {pasteOpen && (
+        <div className="border-b border-slate-800 bg-[#0F172A] px-4 py-3">
+          <div className="mb-1.5 flex items-center justify-between text-xs">
+            <span className="font-semibold text-violet-300">Paste Universal JSON or Claude Code JSONL session log (100% browser-local)</span>
+            <button type="button" onClick={() => setPasteOpen(false)} className="text-slate-400 hover:text-slate-100">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          <textarea
+            value={pasteText}
+            onChange={(e) => setPasteText(e.target.value)}
+            placeholder='{"title":"Debug Session","steps":[{"kind":"edit","toolName":"Edit","targetFile":"app.ts","beforeContent":"a","afterContent":"b"}]}'
+            className="h-24 w-full rounded-lg border border-slate-700 bg-[#0B0F17] p-2 font-mono text-xs text-slate-100 focus:border-violet-500 focus:outline-none"
+          />
+          <div className="mt-2 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                if (pasteText.trim()) {
+                  loadTranscriptText(pasteText, 'pasted-session.jsonl');
+                  setPasteOpen(false);
+                }
+              }}
+              className="rounded bg-violet-500 px-3 py-1 text-xs font-semibold text-slate-950 hover:bg-violet-400"
+            >
+              Parse &amp; Time-Travel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Top Scrubbable Timeline + Cumulative Token Burn Area Chart */}
       <section className="border-b border-slate-800 bg-[#0F172A] px-4 py-3">
-        <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-1.5">
             <button
               type="button"
@@ -213,6 +420,34 @@ export function App() {
             >
               <ChevronRight className="h-4 w-4" />
             </button>
+            <div className="ml-1 flex rounded border border-slate-700 bg-[#111827] p-0.5 font-mono text-[10px]">
+              {([0.5, 1, 2] as const).map((sp) => (
+                <button
+                  key={sp}
+                  type="button"
+                  onClick={() => setSpeed(sp)}
+                  className={`rounded px-1.5 py-0.5 ${speed === sp ? 'bg-violet-500/25 text-violet-200' : 'text-slate-400'}`}
+                >
+                  {sp}x
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => jumpToNext((s) => s.outcome === 'fail')}
+              className="ml-1 inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200 hover:bg-rose-500/20"
+              title="Jump to next failed command/test"
+            >
+              <FastForward className="h-3 w-3" /> Next Fail
+            </button>
+            <button
+              type="button"
+              onClick={() => jumpToNext((s) => s.kind === 'edit' || s.kind === 'write')}
+              className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200 hover:bg-amber-500/20"
+              title="Jump to next file edit"
+            >
+              <FastForward className="h-3 w-3" /> Next Edit
+            </button>
             <span className="ml-2 font-mono text-xs text-slate-300">
               Step {stepIdx + 1} / {session.steps.length}
             </span>
@@ -227,22 +462,42 @@ export function App() {
               setPlaying(false);
               setStepIdx(Number(e.target.value));
             }}
-            className="mx-3 h-1.5 flex-1 cursor-pointer accent-violet-400"
+            className="mx-2 h-1.5 min-w-[140px] flex-1 cursor-pointer accent-violet-400"
           />
 
-          <div className="hidden items-center gap-3 text-[11px] text-slate-400 sm:flex">
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-sm bg-sky-400" /> Input</span>
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-sm bg-slate-600" /> Cache</span>
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-sm bg-violet-400" /> Output</span>
-            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-rose-500" /> Fail</span>
+          {/* Cumulative Token Burn Mini Area Chart */}
+          <div className="hidden items-center gap-3 rounded-lg border border-slate-800 bg-[#0B0F17] px-2.5 py-1 md:flex">
+            <div className="text-[10px] leading-tight">
+              <div className="font-semibold text-slate-300">Cumulative Burn</div>
+              <div className="font-mono text-violet-300">
+                ${(burnCurve[stepIdx]?.cumCost ?? 0).toFixed(4)} · fail tax ${wastedFailCost.toFixed(4)}
+              </div>
+            </div>
+            <svg width={180} height={36} viewBox="0 0 320 44" className="overflow-visible">
+              <defs>
+                <linearGradient id="burnGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#a78bfa" stopOpacity="0.45" />
+                  <stop offset="100%" stopColor="#a78bfa" stopOpacity="0.02" />
+                </linearGradient>
+              </defs>
+              <path d={burnSvg.area} fill="url(#burnGrad)" />
+              <path d={burnSvg.line} fill="none" stroke="#a78bfa" strokeWidth="2.2" />
+              {burnSvg.pts?.map((pt) =>
+                pt.fail ? <circle key={pt.index} cx={pt.x} cy={pt.y} r="4.5" fill="#f43f5e" /> : null,
+              )}
+              <line x1={burnSvg.playX} y1={0} x2={burnSvg.playX} y2={44} stroke="#38bdf8" strokeWidth="1.5" strokeDasharray="3 2" />
+              <circle cx={burnSvg.playX} cy={burnSvg.playY} r="4" fill="#38bdf8" />
+            </svg>
           </div>
         </div>
 
-        {/* Interactive per-step token & event strip */}
+        {/* Interactive per-step stacked token bar strip */}
         <div className="grid grid-flow-col gap-1.5 overflow-x-auto pb-1">
           {session.steps.map((s) => {
             const total = s.inputTokens + s.cacheReadTokens + s.outputTokens;
-            const hPct = Math.max(12, Math.round((total / maxTokensInStep) * 100));
+            const hPct = Math.max(16, Math.round((total / maxTokensInStep) * 100));
+            const outPct = Math.round((s.outputTokens / Math.max(1, total)) * 100);
+            const inPct = Math.round((s.inputTokens / Math.max(1, total)) * 100);
             const active = s.index === stepIdx;
             const barColor =
               s.outcome === 'fail'
@@ -261,45 +516,73 @@ export function App() {
                   setStepIdx(s.index);
                 }}
                 title={`#${s.index + 1} ${s.summary} (${total} tok, $${s.costUsd.toFixed(4)})`}
-                className={`group flex h-14 min-w-[34px] flex-col items-center justify-end rounded-lg border px-1 py-1 transition ${
+                className={`group flex h-14 min-w-[36px] flex-col items-center justify-end rounded-lg border px-1 py-1 transition ${
                   active
-                    ? 'border-violet-400 bg-violet-500/20'
+                    ? 'border-violet-400 bg-violet-500/20 shadow-[0_0_16px_-4px_rgba(167,139,250,0.6)]'
                     : 'border-slate-800 bg-[#111827] hover:border-slate-600'
                 }`}
               >
                 <div className="flex h-8 w-full items-end justify-center">
-                  <div className={`w-3 rounded-t ${barColor}`} style={{ height: `${hPct}%` }} />
+                  <div
+                    className="flex w-3.5 flex-col justify-end overflow-hidden rounded-t bg-slate-700"
+                    style={{ height: `${hPct}%` }}
+                  >
+                    <div className="w-full bg-violet-400" style={{ height: `${outPct}%` }} />
+                    <div className={`w-full ${barColor}`} style={{ height: `${Math.max(20, inPct)}%` }} />
+                  </div>
                 </div>
-                <span className="mt-0.5 font-mono text-[9px] text-slate-400">#{s.index + 1}</span>
+                <span className={`mt-0.5 font-mono text-[9px] ${s.outcome === 'fail' ? 'font-bold text-rose-400' : 'text-slate-400'}`}>
+                  #{s.index + 1}
+                </span>
               </button>
             );
           })}
         </div>
       </section>
 
-      {/* Main Split: Left Codebase Heatmap + Snapshot, Right Step Inspector + Revert Patch */}
+      {/* Main Split: Left Time-Travel Treemap Heatmap + Snapshot, Right Step Inspector + Revert Patch */}
       <div className="grid flex-1 overflow-hidden lg:grid-cols-[1.05fr_1.25fr]">
-        {/* Codebase Touch Heatmap & Reconstructed Snapshot */}
         <section className="flex flex-col overflow-hidden border-r border-slate-800 bg-[#0B0F17]">
           <div className="flex items-center justify-between border-b border-slate-800 bg-[#111827] px-4 py-2.5">
             <div className="flex items-center gap-2">
               <Flame className="h-4 w-4 text-amber-400" />
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-200">
-                Codebase Touch Heatmap (Size vs. Read/Edit Thrash)
+                Codebase Touch Heatmap
               </h2>
+            </div>
+            <div className="flex rounded border border-slate-700 bg-[#0B0F17] p-0.5 text-[10px]">
+              <button
+                type="button"
+                onClick={() => setHeatmapScope('upto')}
+                className={`rounded px-2 py-0.5 ${heatmapScope === 'upto' ? 'bg-amber-500/20 text-amber-200' : 'text-slate-400'}`}
+              >
+                Up to Step #{stepIdx + 1}
+              </button>
+              <button
+                type="button"
+                onClick={() => setHeatmapScope('full')}
+                className={`rounded px-2 py-0.5 ${heatmapScope === 'full' ? 'bg-amber-500/20 text-amber-200' : 'text-slate-400'}`}
+              >
+                Full Session
+              </button>
             </div>
           </div>
 
           <div className="grid gap-2.5 p-4 sm:grid-cols-2">
-            {session.heatmap.map((f) => {
+            {dynamicHeatmap.map((f) => {
               const hot = f.edits >= 3 || f.thrashScore >= 6;
+              const warm = !hot && f.edits >= 1;
+              const touched = f.reads + f.edits > 0;
               const tileStyle = hot
-                ? 'border-rose-500/60 bg-rose-500/10'
-                : f.edits >= 1
-                  ? 'border-amber-500/50 bg-amber-500/10'
-                  : 'border-slate-800 bg-[#111827]';
+                ? 'border-rose-500/70 bg-gradient-to-br from-rose-500/20 to-rose-950/30 shadow-[0_0_24px_-8px_rgba(244,63,94,0.5)]'
+                : warm
+                  ? 'border-amber-500/55 bg-gradient-to-br from-amber-500/15 to-amber-950/20'
+                  : touched
+                    ? 'border-sky-500/40 bg-sky-950/20'
+                    : 'border-slate-800/80 bg-[#111827]/60 opacity-55';
               const activeFile = currentStep?.targetFile === f.path;
-              const weightSpan = f.estimatedBytes > 600 ? 'sm:col-span-2' : '';
+              const weightSpan = f.estimatedBytes > 550 ? 'sm:col-span-2' : '';
+              const heatPct = Math.min(100, f.thrashScore * 14);
               return (
                 <button
                   key={f.path}
@@ -315,11 +598,21 @@ export function App() {
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="truncate font-mono text-xs font-bold text-slate-100">{f.path}</span>
-                    {hot && (
-                      <span className="shrink-0 rounded bg-rose-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-rose-300">
+                    {hot ? (
+                      <span className="shrink-0 rounded bg-rose-500/25 px-1.5 py-0.5 text-[10px] font-semibold text-rose-200">
                         THRASH ({f.edits} edits)
                       </span>
-                    )}
+                    ) : warm ? (
+                      <span className="shrink-0 rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-200">
+                        {f.edits} edit(s)
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-900/90">
+                    <div
+                      className={`h-full transition-all ${hot ? 'bg-rose-400' : warm ? 'bg-amber-400' : 'bg-sky-400'}`}
+                      style={{ width: `${heatPct}%` }}
+                    />
                   </div>
                   <div className="mt-2 flex items-center justify-between font-mono text-[11px] text-slate-400">
                     <span>{f.reads} reads · {f.edits} edits</span>
@@ -398,30 +691,55 @@ export function App() {
 
               {stepDiffLines.length > 0 && (
                 <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#0B0F17]">
-                  <div className="border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-xs font-semibold text-slate-300">
-                    Step #{stepIdx + 1} Edit Diff
+                  <div className="flex items-center justify-between border-b border-slate-800 bg-slate-900/70 px-3 py-1.5 text-xs font-semibold text-slate-300">
+                    <span>Step #{stepIdx + 1} Edit Diff</span>
+                    <button
+                      type="button"
+                      onClick={() => setDiffMode((m) => (m === 'unified' ? 'split' : 'unified'))}
+                      className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0B0F17] px-2 py-0.5 text-[10px] text-sky-300 hover:border-sky-500"
+                    >
+                      <Columns2 className="h-3 w-3" />
+                      <span>{diffMode === 'unified' ? 'Switch to Split' : 'Switch to Unified'}</span>
+                    </button>
                   </div>
-                  <div className="max-h-72 overflow-auto font-mono text-[11.5px] leading-5">
-                    {stepDiffLines.map((l, idx) => (
-                      <div
-                        key={idx}
-                        className={`grid grid-cols-[40px_40px_18px_1fr] px-2 ${
-                          l.type === 'add'
-                            ? 'bg-emerald-500/10 text-emerald-200'
-                            : l.type === 'del'
-                              ? 'bg-rose-500/10 text-rose-200'
-                              : 'text-slate-400'
-                        }`}
-                      >
-                        <span className="select-none pr-2 text-right text-[10px] text-slate-600">{l.oldLn ?? ''}</span>
-                        <span className="select-none pr-2 text-right text-[10px] text-slate-600">{l.newLn ?? ''}</span>
-                        <span className="select-none text-center font-bold">
-                          {l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' '}
-                        </span>
-                        <pre className="whitespace-pre">{l.text || ' '}</pre>
-                      </div>
-                    ))}
-                  </div>
+                  {diffMode === 'unified' ? (
+                    <div className="max-h-72 overflow-auto font-mono text-[11.5px] leading-5">
+                      {stepDiffLines.map((l, idx) => (
+                        <div
+                          key={idx}
+                          className={`grid grid-cols-[40px_40px_18px_1fr] px-2 ${
+                            l.type === 'add'
+                              ? 'bg-emerald-500/10 text-emerald-200'
+                              : l.type === 'del'
+                                ? 'bg-rose-500/10 text-rose-200'
+                                : 'text-slate-400'
+                          }`}
+                        >
+                          <span className="select-none pr-2 text-right text-[10px] text-slate-600">{l.oldLn ?? ''}</span>
+                          <span className="select-none pr-2 text-right text-[10px] text-slate-600">{l.newLn ?? ''}</span>
+                          <span className="select-none text-center font-bold">
+                            {l.type === 'add' ? '+' : l.type === 'del' ? '-' : ' '}
+                          </span>
+                          <pre className="whitespace-pre">{l.text || ' '}</pre>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-auto font-mono text-[11px] leading-5">
+                      {splitRows.map((row, idx) => (
+                        <div key={idx} className="grid grid-cols-2 divide-x divide-slate-800">
+                          <div className={`flex px-2 ${row.oldKind === 'del' ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>
+                            <span className="w-7 shrink-0 select-none text-right pr-2 text-[10px] text-slate-600">{row.oldLn ?? ''}</span>
+                            <pre className="truncate whitespace-pre">{row.oldText || ' '}</pre>
+                          </div>
+                          <div className={`flex px-2 ${row.newKind === 'add' ? 'bg-emerald-500/10 text-emerald-200' : 'text-slate-400'}`}>
+                            <span className="w-7 shrink-0 select-none text-right pr-2 text-[10px] text-slate-600">{row.newLn ?? ''}</span>
+                            <pre className="truncate whitespace-pre">{row.newText || ' '}</pre>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
