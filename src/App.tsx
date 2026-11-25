@@ -29,6 +29,7 @@ import {
 } from './core/parser.ts';
 import type { ReplaySession, StepKind } from './core/types.ts';
 import { ContextWindowXray, McpTopologyRadar } from './components/ContextMcpViews.tsx';
+import { analyzeSessionEfficiency, formatSessionAuditMarkdown } from './core/diagnostics.ts';
 
 type AgentMode = 'replay' | 'context' | 'mcp';
 
@@ -132,6 +133,17 @@ export function App() {
     () => session.steps.filter((s) => s.outcome === 'fail').reduce((acc, s) => acc + s.costUsd, 0),
     [session.steps],
   );
+  const efficiency = useMemo(() => analyzeSessionEfficiency(session), [session]);
+
+  const exportAuditMd = () => {
+    const md = formatSessionAuditMarkdown(session, efficiency);
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `agent-replay-audit-${session.id}.md`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  };
 
   // Dynamic time-travel heatmap (touch counts up to current step vs full session)
   const dynamicHeatmap = useMemo(() => {
@@ -366,6 +378,16 @@ export function App() {
 
           <button
             type="button"
+            onClick={exportAuditMd}
+            className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-[#0B0F17] px-2.5 py-1 text-xs text-slate-200 hover:border-emerald-500"
+            title="Download full Markdown session audit"
+          >
+            <Download className="h-3.5 w-3.5 text-emerald-400" />
+            <span>Audit .md</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setPasteOpen((v) => !v)}
             className="inline-flex items-center gap-1 rounded-lg border border-violet-500/40 bg-violet-500/10 px-2.5 py-1 text-xs font-medium text-violet-200 hover:bg-violet-500/20"
           >
@@ -395,6 +417,26 @@ export function App() {
         <McpTopologyRadar />
       ) : (
       <>
+      {/* Efficiency Score + 6-Model Cost Comparator Strip */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 bg-[#090D16] px-4 py-1.5 text-[11px]">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded border border-violet-500/40 bg-violet-500/15 px-2 py-0.5 font-mono font-bold text-violet-200">
+            Efficiency {efficiency.efficiencyScore}/100
+          </span>
+          <span className="font-mono text-slate-400">
+            {efficiency.thrashLoops} thrash loop(s) · {efficiency.recommendations[0]}
+          </span>
+        </div>
+        <div className="hidden items-center gap-1.5 font-mono text-[10px] xl:flex">
+          <span className="text-slate-500">Same trace on:</span>
+          {efficiency.modelComparisons.slice(0, 4).map((m) => (
+            <span key={m.id} className="rounded border border-slate-800 bg-[#111827] px-1.5 py-0.5 text-slate-300">
+              {m.label.split(' ').slice(0, 2).join(' ')} <strong className="text-emerald-300">${m.totalUsd.toFixed(4)}</strong>
+            </span>
+          ))}
+        </div>
+      </div>
+
       {/* Paste Transcript Drawer */}
       {pasteOpen && (
         <div className="border-b border-slate-800 bg-[#0F172A] px-4 py-3">

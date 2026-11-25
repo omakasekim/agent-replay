@@ -4,6 +4,7 @@ import {
   Cpu,
   Download,
   Network,
+  Plus,
   Scissors,
   Server,
   ShieldAlert,
@@ -43,6 +44,29 @@ export function ContextWindowXray() {
   const [segments, setSegments] = useState<ContextSegment[]>(() =>
     CONTEXT_BUDGET_PRESETS[0].segments.map((s) => ({ ...s })),
   );
+  const [customOpen, setCustomOpen] = useState(false);
+  const [customLabel, setCustomLabel] = useState('Custom Prompt / Schema');
+  const [customText, setCustomText] = useState('');
+
+  const addCustomSegment = () => {
+    if (!customText.trim()) return;
+    const estTokens = Math.max(100, Math.round(customText.length / 3.8));
+    setSegments((prev) => [
+      ...prev,
+      {
+        id: `custom_${Date.now()}`,
+        label: customLabel.trim() || 'Pasted Context Block',
+        category: 'pinned-files',
+        tokens: estTokens,
+        prunable: true,
+        enabled: true,
+        compressionPct: 0,
+        note: `Measured locally (~${estTokens.toLocaleString()} tokens from ${customText.length.toLocaleString()} chars)`,
+      },
+    ]);
+    setCustomText('');
+    setCustomOpen(false);
+  };
 
   const summary = useMemo(
     () => computeContextBudget(segments, windowLimit, CONTEXT_BUDGET_PRESETS[presetIdx]?.pricePerMillionUsd ?? 3),
@@ -97,23 +121,68 @@ export function ContextWindowXray() {
             </button>
           ))}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex rounded border border-slate-700 bg-[#111827] p-0.5 font-mono text-[10px]">
+            {[128_000, 200_000, 1_000_000].map((lim) => (
+              <button
+                key={lim}
+                type="button"
+                onClick={() => setWindowLimit(lim)}
+                className={`rounded px-2 py-0.5 ${windowLimit === lim ? 'bg-sky-500/20 text-sky-200' : 'text-slate-400'}`}
+              >
+                {lim >= 1_000_000 ? '1M' : `${lim / 1000}k`}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => setCustomOpen((v) => !v)}
+            className="inline-flex items-center gap-1 rounded-lg border border-violet-500/40 bg-violet-500/15 px-2.5 py-1 font-semibold text-violet-200 hover:bg-violet-500/25"
+          >
+            <Plus className="h-3.5 w-3.5" /> Measure Prompt
+          </button>
           <button
             type="button"
             onClick={autoTrimRecommended}
             className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 font-semibold text-emerald-200 hover:bg-emerald-500/25"
           >
-            <Scissors className="h-3.5 w-3.5" /> Auto-Optimize Context
+            <Scissors className="h-3.5 w-3.5" /> Auto-Optimize
           </button>
           <button
             type="button"
             onClick={exportPlan}
             className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-[#111827] px-2.5 py-1 text-slate-200 hover:border-sky-500"
           >
-            <Download className="h-3.5 w-3.5 text-sky-400" /> Export JSON
+            <Download className="h-3.5 w-3.5 text-sky-400" /> JSON
           </button>
         </div>
       </div>
+
+      {customOpen && (
+        <div className="border-b border-slate-800 bg-[#111827] px-5 py-3">
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <input
+              value={customLabel}
+              onChange={(e) => setCustomLabel(e.target.value)}
+              className="rounded border border-slate-700 bg-[#090D16] px-2.5 py-1 font-mono text-xs text-slate-100"
+              placeholder="Segment label..."
+            />
+            <span className="font-mono text-xs text-violet-300">
+              Est. ~{Math.round(customText.length / 3.8).toLocaleString()} tokens
+            </span>
+          </div>
+          <textarea
+            value={customText}
+            onChange={(e) => setCustomText(e.target.value)}
+            placeholder="Paste any system prompt, file content, or MCP JSON schema to measure its real token share..."
+            className="h-20 w-full rounded-lg border border-slate-700 bg-[#090D16] p-2.5 font-mono text-xs text-slate-100"
+          />
+          <div className="mt-2 flex justify-end gap-2">
+            <button type="button" onClick={() => setCustomOpen(false)} className="rounded border border-slate-700 px-3 py-1 text-xs">Cancel</button>
+            <button type="button" onClick={addCustomSegment} className="rounded bg-violet-500 px-3 py-1 text-xs font-semibold text-slate-950">Add to Budget</button>
+          </div>
+        </div>
+      )}
 
       <div className="flex-1 space-y-5 overflow-y-auto p-5">
         {/* Stacked Context Utilization Gauge */}
@@ -238,7 +307,14 @@ export function ContextWindowXray() {
 
 export function McpTopologyRadar() {
   const [selectedServerId, setSelectedServerId] = useState<string>(DEMO_MCP_SERVERS[0].id);
-  const stats = useMemo(() => computeMcpStats(DEMO_MCP_SERVERS), []);
+  const [disabledServers, setDisabledServers] = useState<Set<string>>(() => new Set());
+  const activeServers = useMemo(
+    () => DEMO_MCP_SERVERS.filter((s) => !disabledServers.has(s.id)),
+    [disabledServers],
+  );
+  const stats = useMemo(() => computeMcpStats(activeServers), [activeServers]);
+  const allStats = useMemo(() => computeMcpStats(DEMO_MCP_SERVERS), []);
+  const savedMcpTok = allStats.totalSchemaTokens - stats.totalSchemaTokens;
   const selectedServer = DEMO_MCP_SERVERS.find((s) => s.id === selectedServerId) ?? DEMO_MCP_SERVERS[0];
   const maxTraceEnd = Math.max(1, ...DEMO_MCP_TRACES.map((t) => t.startMs + t.durationMs));
 
@@ -364,9 +440,31 @@ export function McpTopologyRadar() {
               </p>
             </div>
           </div>
-          <span className="rounded bg-slate-800 px-2 py-1 font-mono text-xs text-violet-300">
-            {selectedServer.tools.reduce((a, t) => a + t.schemaTokens, 0)} schema tok
-          </span>
+          <div className="flex items-center gap-2">
+            {savedMcpTok > 0 && (
+              <span className="rounded bg-emerald-500/15 px-2 py-1 font-mono text-[11px] text-emerald-300">
+                -{savedMcpTok} tok saved
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() =>
+                setDisabledServers((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(selectedServer.id)) next.delete(selectedServer.id);
+                  else next.add(selectedServer.id);
+                  return next;
+                })
+              }
+              className={`rounded-md border px-2.5 py-1 font-mono text-[11px] font-semibold ${
+                disabledServers.has(selectedServer.id)
+                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                  : 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+              }`}
+            >
+              {disabledServers.has(selectedServer.id) ? 'Enable Server' : 'Simulate Disable'}
+            </button>
+          </div>
         </div>
 
         <div className="space-y-3">
