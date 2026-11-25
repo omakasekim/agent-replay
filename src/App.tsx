@@ -28,6 +28,9 @@ import {
   generateRollbackFromStepPatch,
 } from './core/parser.ts';
 import type { ReplaySession, StepKind } from './core/types.ts';
+import { ContextWindowXray, McpTopologyRadar } from './components/ContextMcpViews.tsx';
+
+type AgentMode = 'replay' | 'context' | 'mcp';
 
 const KIND_BADGE: Record<StepKind, string> = {
   read: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
@@ -39,6 +42,7 @@ const KIND_BADGE: Record<StepKind, string> = {
 };
 
 export function App() {
+  const [agentMode, setAgentMode] = useState<AgentMode>('replay');
   const [presetId, setPresetId] = useState<string>('rate-limiter');
   const [session, setSession] = useState<ReplaySession>(() =>
     buildReplaySession(DEMO_AGENT_SESSION_JSON, { id: 'rate-limiter', isDemo: true }),
@@ -309,6 +313,28 @@ export function App() {
             </div>
           </div>
 
+          <div className="flex rounded-lg border border-slate-700 bg-[#0B0F17] p-0.5 text-xs">
+            {(
+              [
+                { id: 'replay', label: 'Time-Travel' },
+                { id: 'context', label: 'Context Budget' },
+                { id: 'mcp', label: 'MCP Radar' },
+              ] as const
+            ).map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setAgentMode(m.id)}
+                className={`rounded-md px-2.5 py-1 font-medium transition ${
+                  agentMode === m.id ? 'bg-violet-500/20 text-violet-200' : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+
+          {agentMode === 'replay' && (
           <select
             value={presetId}
             onChange={(e) => loadPreset(e.target.value)}
@@ -321,6 +347,7 @@ export function App() {
             ))}
             {presetId === 'custom' && <option value="custom">Custom Uploaded / Pasted Trace</option>}
           </select>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -362,6 +389,12 @@ export function App() {
         </div>
       </header>
 
+      {agentMode === 'context' ? (
+        <ContextWindowXray />
+      ) : agentMode === 'mcp' ? (
+        <McpTopologyRadar />
+      ) : (
+      <>
       {/* Paste Transcript Drawer */}
       {pasteOpen && (
         <div className="border-b border-slate-800 bg-[#0F172A] px-4 py-3">
@@ -799,6 +832,8 @@ export function App() {
           )}
         </section>
       </div>
+      </>
+      )}
     </div>
   );
 }
